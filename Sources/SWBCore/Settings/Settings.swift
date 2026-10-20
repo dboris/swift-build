@@ -1240,6 +1240,11 @@ private class SettingsBuilder: ProjectMatchLookup {
 
         /// A collection of precalculated settings that need to be used during the full construction of the settings.
         let settings: BoundSettings
+
+        /// Whether the target's own `SDKROOT` was `auto`, before an SDK was bound.
+        ///
+        /// A Swift SDK sets `SDKROOT` to its sysroot among its custom properties, so the bound value in `settings` no longer reads `auto` for a target which resolved to one.
+        let sdkRootIsAutomatic: Bool
     }
 
     /// This struct captures bound deployment target information for the settings.
@@ -1505,7 +1510,9 @@ private class SettingsBuilder: ProjectMatchLookup {
 
         // Add the target settings, if configured.
         if let target = self.target, let config = targetConfiguration {
-            addTargetSettings(target, specLookupContext, config, boundProperties.sdk, usesAutomaticSDK: boundProperties.settings[BuiltinMacros.SDKROOT] == "auto")
+            // Under a Swift SDK run destination, a target with an automatic SDK stays one even though the SDK replaced its `SDKROOT`: its host tools (and their dependencies) must still be specialized for the host, even when the Swift SDK is for the host's own platform.
+            let usesAutomaticSDK = boundProperties.settings[BuiltinMacros.SDKROOT] == "auto" || (boundProperties.sdkRootIsAutomatic && SpecializationParameters.runDestinationUsesSwiftSDK(parameters))
+            addTargetSettings(target, specLookupContext, config, boundProperties.sdk, usesAutomaticSDK: usesAutomaticSDK)
         }
 
         // If we're constructing a Settings object for use by the editor, then we stop here; we don't add any overrides.
@@ -1780,9 +1787,13 @@ private class SettingsBuilder: ProjectMatchLookup {
         // - Then, we let the run destination override the SDK if needed.
         // - If the SDK or Platform changed, we do a second pass to add the new SDK/Platform settings. This ensures that we can resolve TOOLCHAINS accurately later.
         var sdkroot: String! = nil
+        var sdkRootIsAutomatic = false
         for i in 0 ..< 2 {
             // Perform the initial SDK resolution (this may drive the platform).
             sdkroot = createScope(effectiveTargetConfig, sdkToUse: sdk).evaluate(BuiltinMacros.SDKROOT).str
+            if i == 0 {
+                sdkRootIsAutomatic = sdkroot == "auto"
+            }
 
             // We will replace SDKROOT values of "auto" here if the run destination is compatible.
             let usesReplaceableAutomaticSDKRoot: Bool
@@ -1983,7 +1994,7 @@ private class SettingsBuilder: ProjectMatchLookup {
         let scope = createScope(effectiveTargetConfig, sdkToUse: sdk)
         let settings = BoundProperties.BoundSettings(scope, [BuiltinMacros.IPHONEOS_DEPLOYMENT_TARGET, BuiltinMacros.DEVELOPMENT_TEAM], [BuiltinMacros.OTHER_LDFLAGS,BuiltinMacros.PRODUCT_SPECIFIC_LDFLAGS],[BuiltinMacros.SDKROOT], [])
 
-        return BoundProperties(sdk: sdk, sdkVariant: sdkVariant, platform: platform, toolchains: toolchains, sparseSDKs: sparseSDKs, preOverrides: preOverrides, settings: settings)
+        return BoundProperties(sdk: sdk, sdkVariant: sdkVariant, platform: platform, toolchains: toolchains, sparseSDKs: sparseSDKs, preOverrides: preOverrides, settings: settings, sdkRootIsAutomatic: sdkRootIsAutomatic)
     }
 
     /// Create a `MacroEvaluationScope` for evaluating with the current table contents.
@@ -2023,7 +2034,9 @@ private class SettingsBuilder: ProjectMatchLookup {
                let destinationSDK = try? sdkRegistry.lookup(nameOrPath: destination.sdk, basePath: Path.root, activeRunDestination: destination),
                let sdkPlatform = sdk.platformName,
                let destinationPlatform = destinationSDK.platformName,
-               sdkPlatform == destinationPlatform {
+               sdkPlatform == destinationPlatform,
+               // A Swift SDK destination is that SDK, not its platform: a host tool built against the host's own SDK for the same platform is not built for the destination.
+               !SpecializationParameters.runDestinationUsesSwiftSDK(parameters) || sdk.canonicalName == destinationSDK.canonicalName {
                 conditionParameterValues[BuiltinMacros.destinationPlatformCondition] = ["YES"]
             } else {
                 conditionParameterValues[BuiltinMacros.destinationPlatformCondition] = ["NO"]
@@ -2729,6 +2742,14 @@ private class SettingsBuilder: ProjectMatchLookup {
                 sdkTable.push(BuiltinMacros.RPATH_ORIGIN, literal: origin)
             }
             sdkTable.push(BuiltinMacros.PLATFORM_USES_DSYMS, literal: imageFormat.usesDsyms)
+        }
+
+        // A target built against the platform's own SDK in a build for a Swift SDK of that same platform (a host tool, or a dependency of one) gets its own products directory: the destination's products already use the platform's name, and a target can be configured both ways.
+        if SpecializationParameters.runDestinationUsesSwiftSDK(parameters),
+           let destination = parameters.activeRunDestination,
+           sdk.platformName == destination.platform,
+           !SpecializationParameters.isRunDestinationSDK(sdk, parameters: parameters, workspaceContext: workspaceContext) {
+            sdkTable.push(BuiltinMacros.EFFECTIVE_PLATFORM_NAME, BuiltinMacros.namespace.parseString("$(inherited)-host"))
         }
 
         // Add additional SDK default settings.
