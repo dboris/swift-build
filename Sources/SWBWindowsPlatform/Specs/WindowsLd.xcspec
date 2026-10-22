@@ -101,6 +101,13 @@
                 CommandLineArgs = ();
             },
             {
+                // ld64 specific. The registered Windows SDK empties this in its DefaultProperties, but an SDK
+                // synthesized from a Swift SDK does not, and lld-link then fails on `-dependency_info`.
+                Name = "LD_DEPENDENCY_INFO_FILE";
+                Type = Path;
+                DefaultValue = "";
+            },
+            {
                 // Mach-O specific
                 Name = "LD_FINAL_OUTPUT_FILE";
                 Type = Path;
